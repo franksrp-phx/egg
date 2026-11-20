@@ -1,0 +1,96 @@
+# .github/workflows/epg.yml
+# Builds one merged EPG file every 6 hours and publishes it at:
+#   https://github.com/<YOUR-USERNAME>/<REPO>/releases/download/epg/merged.xml.gz
+#
+# Setup:
+#   1. Create a PUBLIC repo (release downloads from private repos need a login).
+#   2. Settings -> Secrets and variables -> Actions -> New repository secret
+#        Name:  PROVIDER_EPG_URL
+#        Value: your provider's xmltv.php link (keeps your login out of public view)
+#   3. Add this file at .github/workflows/epg.yml
+#   4. Actions tab -> "Build merged EPG" -> Run workflow
+
+name: Build merged EPG
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"   # every 6 hours
+  workflow_dispatch:          # lets you run it manually
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xmltv tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xmltv-util
+
+      - name: Download and merge
+        env:
+          PROVIDER_EPG_URL: ${{ secrets.PROVIDER_EPG_URL }}
+        run: |
+          set -uo pipefail
+          mkdir -p work
+          urls=(
+            "https://epgshare01.online/epgshare01/epg_ripper_US2.xml.gz"
+            "https://epgshare01.online/epgshare01/epg_ripper_US_SPORTS1.xml.gz"
+            "https://epgshare01.online/epgshare01/epg_ripper_US_LOCALS1.xml.gz"
+          )
+          [ -n "${PROVIDER_EPG_URL:-}" ] && urls+=("$PROVIDER_EPG_URL")
+
+          i=0
+          for url in "${urls[@]}"; do
+            i=$((i+1))
+            dl="work/src$i.dl"
+            if ! curl -fsSL --retry 3 --max-time 600 -o "$dl" "$url"; then
+              echo "::warning::Download failed for source $i"; continue
+            fi
+            if gzip -t "$dl" 2>/dev/null; then
+              gunzip -c "$dl" > "work/src$i.xml"
+            else
+              mv "$dl" "work/src$i.xml"
+            fi
+            rm -f "$dl"
+            echo "Source $i OK"
+          done
+
+          files=(work/src*.xml)
+          [ -e "${files[0]}" ] || { echo "::error::Nothing downloaded"; exit 1; }
+
+          cp "${files[0]}" work/merged.xml
+          for f in "${files[@]:1}"; do
+            if tv_merge -i work/merged.xml -m "$f" -o work/merged.tmp; then
+              mv work/merged.tmp work/merged.xml
+            else
+              echo "::warning::Merge failed for $f (skipped)"
+            fi
+          done
+
+          gzip -9 -c work/merged.xml > merged.xml.gz
+          echo "Channels: $(grep -c '<channel ' work/merged.xml)"
+          ls -lh merged.xml.gz
+
+      - name: Publish to release "epg"
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view epg >/dev/null 2>&1 || \
+            gh release create epg --title "Merged EPG" --notes "Auto-updated every 6 hours."
+          gh release upload epg merged.xml.gz --clobber
+
+      - name: Keep schedule active
+        # GitHub pauses schedules after 60 days without commits; this prevents that.
+        run: |
+          date -u > last-updated.txt
+          git config user.name "epg-bot"
+          git config user.email "epg-bot@users.noreply.github.com"
+          git add last-updated.txt
+          git commit -m "EPG updated" || true
+          git push || true
